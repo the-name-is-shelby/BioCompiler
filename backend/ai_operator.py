@@ -82,6 +82,10 @@ note if present, otherwise per the instruction). Reference only numbers
 present in the summary you were given. Never state a number that isn't in
 the data. Never describe a mechanism that isn't a simple consequence of one
 gene repressing or activating another.
+
+Write in plain sentences only. Do not use markdown formatting of any
+kind — no asterisks, no underscores, no headers, no bullet points. This
+text is displayed directly on a webpage with no markdown rendering.
 """
 
 
