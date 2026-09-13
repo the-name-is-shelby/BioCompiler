@@ -7,8 +7,10 @@ from parts_library import (
     default_repressilator_model,
     default_toggle_model,
     incoherent_feedforward_loop_model,
+    real_gate_ring_model,
+    cello_nor_gate_demo,
 )
-from simulator import simulate, diff_traces
+from simulator import simulate, simulate_gillespie, diff_traces
 from ai_operator import edit_circuit, explain_diff
 
 app = FastAPI(title="BioCompiler API")
@@ -42,6 +44,8 @@ def get_default_circuit(name: str):
         "repressilator": default_repressilator_model,
         "toggle": default_toggle_model,
         "feedforward": incoherent_feedforward_loop_model,
+        "real_gate_ring": real_gate_ring_model,
+        "cello_nor_gate": cello_nor_gate_demo,
     }
     if name not in catalog:
         raise HTTPException(status_code=404, detail=f"Unknown circuit '{name}'. Options: {list(catalog.keys())}")
@@ -49,13 +53,13 @@ def get_default_circuit(name: str):
 
 
 @app.post("/simulate")
-def run_simulation(model: ModelRequest):
+def run_simulation(model: ModelRequest, mode: str = "deterministic"):
     model_dict = model.model_dump()
     ok, msg = validate_model(model_dict)
     if not ok:
         raise HTTPException(status_code=400, detail=f"Model rejected by whitelist: {msg}")
     try:
-        result = simulate(model_dict)
+        result = simulate_gillespie(model_dict) if mode == "stochastic" else simulate(model_dict)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Simulation failed: {e}")
     return result

@@ -107,3 +107,106 @@ def diff_traces(before: dict, after: dict) -> dict:
             }
         summary[run_name] = run_summary
     return summary
+def simulate_gillespie(model: dict, t_max: float = 200.0, max_events: int = 500_000,
+                        seed: int | None = None) -> dict:
+    """Stochastic Simulation Algorithm (Gillespie 1977, direct method) on the
+    SAME schema and SAME parameters as simulate() above. Reaction structure
+    is derived directly from the deterministic ODE terms so the two solvers
+    agree in the mean-field limit:
+        mRNA production : rate = alpha*A(protein)*R(protein) + alpha0  -> mRNA += 1
+        mRNA decay       : rate = mRNA                                  -> mRNA -= 1
+        protein production: rate = beta * mRNA                          -> protein += 1
+        protein decay    : rate = beta * protein                        -> protein -= 1
+
+    HONESTY NOTE: this treats the model's existing dimensionless quantities
+    as integer molecule counts and derives propensities from the model's
+    own kinetic terms. It is NOT built from independently measured
+    per-gene burst-size/copy-number data (e.g. Taniguchi et al. 2010) — it
+    shows the noise structure implied by this model's own equations, not
+    additional independent experimental stochasticity data.
+    """
+    ok, msg = validate_model(model)
+    if not ok:
+        raise ValueError(f"Invalid model, refusing to simulate: {msg}")
+
+    rng = np.random.default_rng(seed)
+    parts = {p["id"]: p for p in model["parts"]}
+    ids = list(parts.keys())
+    n_genes = len(ids)
+    idx = {gid: i for i, gid in enumerate(ids)}
+
+    activators_of = {gid: [] for gid in ids}
+    repressors_of = {gid: [] for gid in ids}
+    for e in model["edges"]:
+        (activators_of if e["type"] == "activate" else repressors_of)[e["to"]].append(e["from"])
+
+    alpha = np.array([parts[g].get("maxExpression", 200.0) for g in ids])
+    alpha0 = np.array([parts[g].get("basalExpression", 0.0) for g in ids])
+    n_hill = np.array([parts[g].get("hillCoeff", 2.0) for g in ids])
+    beta = np.array([parts[g].get("degradationRate", 5.0) for g in ids])
+    K = np.array([parts[g].get("halfMaxConst", 1.0) for g in ids])
+
+    mrna = np.zeros(n_genes)
+    protein = np.zeros(n_genes)
+    mrna[0] = 1  # same initial perturbation as the deterministic solver
+
+    t = 0.0
+    t_hist = [0.0]
+    mrna_hist = [mrna.copy()]
+    protein_hist = [protein.copy()]
+
+    for _ in range(max_events):
+        if t >= t_max:
+            break
+        prod_rate = np.zeros(n_genes)
+        for gid in ids:
+            i = idx[gid]
+            A = 1.0
+            for a_id in activators_of[gid]:
+                a_level = protein[idx[a_id]]
+                A *= (a_level ** n_hill[i]) / (K[i] ** n_hill[i] + a_level ** n_hill[i] + 1e-12)
+            R = 1.0
+            for r_id in repressors_of[gid]:
+                r_level = protein[idx[r_id]]
+                R *= 1.0 / (1.0 + (r_level / K[i]) ** n_hill[i])
+            prod_rate[i] = max(alpha[i] * A * R + alpha0[i], 0.0)
+
+        mrna_decay = mrna.copy()
+        protein_prod = beta * mrna
+        protein_decay = beta * protein
+
+        rates = np.concatenate([prod_rate, mrna_decay, protein_prod, protein_decay])
+        a0 = rates.sum()
+        if a0 <= 0:
+            break
+
+        tau = rng.exponential(1.0 / a0)
+        t += tau
+        if t >= t_max:
+            break
+
+        choice = rng.choice(len(rates), p=rates / a0)
+        reaction, i = divmod(choice, n_genes)
+        if reaction == 0:
+            mrna[i] += 1
+        elif reaction == 1:
+            mrna[i] = max(mrna[i] - 1, 0)
+        elif reaction == 2:
+            protein[i] += 1
+        else:
+            protein[i] = max(protein[i] - 1, 0)
+
+        t_hist.append(t)
+        mrna_hist.append(mrna.copy())
+        protein_hist.append(protein.copy())
+
+    t_arr = np.array(t_hist)
+    mrna_arr = np.array(mrna_hist)
+    protein_arr = np.array(protein_hist)
+    species = {}
+    for gid in ids:
+        i = idx[gid]
+        species[f"{gid}_mRNA"] = mrna_arr[:, i].tolist()
+        species[f"{gid}_protein"] = protein_arr[:, i].tolist()
+
+    return {"t": t_arr.tolist(), "species": species, "success": True, "n_events": len(t_hist) - 1}

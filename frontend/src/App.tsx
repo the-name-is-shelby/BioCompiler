@@ -7,6 +7,7 @@ const COLORS: Record<string, string> = {
   lacI: '#4a90d9', tetR: '#ff8a5c', cI: '#33d6a6',
   geneU: '#4a90d9', geneV: '#ff8a5c',
   geneX: '#4a90d9', geneY: '#ff8a5c', geneZ: '#33d6a6',
+  phlF: '#c86bff', betI: '#ffd166', amtR: '#4adede',
 };
 
 type SimResult = {
@@ -24,6 +25,8 @@ const CIRCUITS = [
   { id: 'repressilator', label: 'Repressilator' },
   { id: 'toggle', label: 'Toggle switch' },
   { id: 'feedforward', label: 'Feedforward loop' },
+  { id: 'real_gate_ring', label: 'Real-gate ring (PhlF/BetI/AmtR)' },
+  { id: 'cello_nor_gate', label: 'Cello NOR gate demo' },
 ];
 
 function friendlyError(raw: string): string {
@@ -116,7 +119,7 @@ function CircuitDiagram({ model }: { model: ModelJson | null }) {
         return (
           <g key={p.id}>
             <circle cx={pos.x} cy={pos.y} r={nodeR} fill={color + '1a'} stroke={color} strokeWidth={2.5} />
-            <text x={pos.x} y={pos.y + 6} textAnchor="middle" fontSize={16} fontWeight={600} fill="var(--text-primary)" fontFamily="IBM Plex Mono, monospace">{p.id}</text>
+            <text x={pos.x} y={pos.y + 6} textAnchor="middle" fontSize={13} fontWeight={600} fill="var(--text-primary)" fontFamily="IBM Plex Mono, monospace">{p.id.includes('_') ? p.id.split('_').slice(-2).join('_') : p.id}</text>
           </g>
         );
       })}
@@ -133,6 +136,7 @@ function CircuitDiagram({ model }: { model: ModelJson | null }) {
 
 function App() {
   const [circuitName, setCircuitName] = useState('repressilator');
+  const [mode, setMode] = useState<'deterministic' | 'stochastic'>('deterministic');
   const [result, setResult] = useState<SimResult | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
@@ -159,7 +163,7 @@ function App() {
         if (cancelled) return;
         setCurrentModel(model);
 
-        const simRes = await fetch(`${API_BASE}/simulate`, {
+        const simRes = await fetch(`${API_BASE}/simulate?mode=${mode}`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(model),
@@ -175,7 +179,7 @@ function App() {
     }
     run();
     return () => { cancelled = true; };
-  }, [circuitName]);
+  }, [circuitName, mode]);
 
   async function handleEditSubmit() {
     if (!currentModel || !instruction.trim()) return;
@@ -207,11 +211,13 @@ function App() {
     ? Object.keys(result.species).filter((k) => k.endsWith('_protein'))
     : [];
 
+  const downsampleStep = result ? Math.max(1, Math.floor(result.t.length / 2000)) : 1;
   const chartData = result
-    ? result.t.map((t, i) => {
+    ? result.t.filter((_, i) => i % downsampleStep === 0).map((t, i) => {
+        const originalIndex = i * downsampleStep;
         const row: Record<string, number> = { t: Math.round(t * 10) / 10 };
         proteinSeries.forEach((key) => {
-          row[key] = Math.round(result.species[key][i] * 100) / 100;
+          row[key] = Math.round(result.species[key][originalIndex] * 100) / 100;
         });
         return row;
       })
@@ -246,7 +252,18 @@ function App() {
           ))}
         </nav>
 
-        <div style={{ marginTop: 'auto', fontSize: 11, color: 'var(--text-muted)' }}>
+        <div style={{ fontSize: 11, color: 'var(--text-muted)', letterSpacing: '0.08em', marginTop: 32, marginBottom: 12, textTransform: 'uppercase' }}>
+          Solver mode
+        </div>
+        <nav style={{ display: 'flex', flexDirection: 'column', gap: 2, marginBottom: 'auto' }}>
+          <button onClick={() => setMode('deterministic')} className={`nav-item ${mode === 'deterministic' ? 'nav-item-active' : ''}`}>
+            Deterministic (ODE)
+          </button>
+          <button onClick={() => setMode('stochastic')} className={`nav-item ${mode === 'stochastic' ? 'nav-item-active' : ''}`}>
+            Stochastic (Gillespie)
+          </button>
+        </nav>
+        <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>
           Kernel v1 · repress / activate
         </div>
       </aside>
