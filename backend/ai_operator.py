@@ -136,3 +136,30 @@ def explain_diff(instruction: str, diff_summary: dict, substitution_note: str | 
         config=types.GenerateContentConfig(system_instruction=EXPLAINER_SYSTEM_PROMPT),
     )
     return response.text
+
+EXPLAIN_CIRCUIT_SYSTEM_PROMPT = """You describe a simulated gene circuit's behavior in plain
+English. You will be given the circuit's structure (which genes repress or activate which
+others) and a per-gene numeric summary computed by a real solver: final value, max, min, mean,
+and whether that gene's trace had settled to a steady value by the end of the simulation window
+(true) or was still fluctuating substantially (false — this indicates oscillation or an
+unfinished transient, not an error).
+
+In 3-5 plain sentences, describe what the circuit does qualitatively — settles to a fixed state,
+oscillates, one gene suppresses another toward zero, etc. — referencing only the genes and
+numbers given. Never state a number not present in the data. Never invent kinetic detail beyond
+what a repress/activate relationship implies.
+
+Write in plain sentences only, no markdown."""
+
+
+def explain_circuit(model: dict, characterization: dict) -> str:
+    prompt = (
+        f"Circuit structure:\n{json.dumps({'parts': [p['id'] for p in model['parts']], 'edges': model['edges']})}\n\n"
+        f"Per-gene numeric summary:\n{json.dumps(characterization)}"
+    )
+    response = client.models.generate_content(
+        model="gemini-3.6-flash",
+        contents=prompt,
+        config=types.GenerateContentConfig(system_instruction=EXPLAIN_CIRCUIT_SYSTEM_PROMPT),
+    )
+    return response.text

@@ -9,9 +9,13 @@ from parts_library import (
     incoherent_feedforward_loop_model,
     real_gate_ring_model,
     cello_nor_gate_demo,
+    cello_gate_to_schema,
+    real_part_to_schema,
+    CELLO_UCF_LIBRARIES,
+    REAL_CHARACTERIZED_PARTS,
 )
-from simulator import simulate, simulate_gillespie, diff_traces
-from ai_operator import edit_circuit, explain_diff
+from simulator import simulate, simulate_gillespie, diff_traces, characterize_dynamics
+from ai_operator import edit_circuit, explain_diff, explain_circuit
 
 app = FastAPI(title="BioCompiler API")
 
@@ -117,3 +121,41 @@ def edit_and_explain(req: EditRequest):
         "substitution_note": substitution_note,
         "explanation": explanation,
     }
+@app.get("/gene_library")
+def gene_library_catalog():
+    """Everything the frontend needs to populate a gene picker, without
+    ever exposing the actual numbers as frontend-editable data."""
+    return {
+        "cello": {lib: sorted(gates.keys()) for lib, gates in CELLO_UCF_LIBRARIES.items()},
+        "characterized": sorted(REAL_CHARACTERIZED_PARTS.keys()),
+    }
+
+
+@app.get("/gene_library/cello/{library}/{gate_id}")
+def get_cello_part(library: str, gate_id: str):
+    try:
+        return cello_gate_to_schema(library, gate_id)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+@app.get("/gene_library/characterized/{gene_id}")
+def get_characterized_part(gene_id: str):
+    try:
+        return real_part_to_schema(gene_id)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+@app.post("/explain_circuit")
+def explain_circuit_endpoint(model: ModelRequest, mode: str = "deterministic"):
+    model_dict = model.model_dump()
+    ok, msg = validate_model(model_dict)
+    if not ok:
+        raise HTTPException(status_code=400, detail=f"Model rejected by whitelist: {msg}")
+    try:
+        result = simulate_gillespie(model_dict) if mode == "stochastic" else simulate(model_dict)
+        characterization = characterize_dynamics(result)
+        explanation = explain_circuit(model_dict, characterization)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Explain failed: {e}")
+    return {"explanation": explanation, "characterization": characterization}

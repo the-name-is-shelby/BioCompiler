@@ -3,6 +3,16 @@ import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContai
 import './App.css';
 
 const API_BASE = 'http://127.0.0.1:8000';
+
+async function fetchWithTimeout(url: string, options: RequestInit = {}, timeoutMs = 20000): Promise<Response> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
 const COLORS: Record<string, string> = {
   lacI: '#4a90d9', tetR: '#ff8a5c', cI: '#33d6a6',
   geneU: '#4a90d9', geneV: '#ff8a5c',
@@ -10,16 +20,9 @@ const COLORS: Record<string, string> = {
   phlF: '#c86bff', betI: '#ffd166', amtR: '#4adede',
 };
 
-type SimResult = {
-  t: number[];
-  species: Record<string, number[]>;
-  success: boolean;
-};
-
-type ModelJson = {
-  parts: { id: string; [key: string]: unknown }[];
-  edges: { from: string; to: string; type: string }[];
-};
+type SimResult = { t: number[]; species: Record<string, number[]>; success: boolean };
+type ModelJson = { parts: { id: string; [key: string]: unknown }[]; edges: { from: string; to: string; type: string }[] };
+type GeneLibrary = { cello: Record<string, string[]>; characterized: string[] };
 
 const CIRCUITS = [
   { id: 'repressilator', label: 'Repressilator' },
@@ -148,7 +151,37 @@ function App() {
   const [editLoading, setEditLoading] = useState(false);
   const [editError, setEditError] = useState<string | null>(null);
 
+  const [circuitExplanation, setCircuitExplanation] = useState<string | null>(null);
+  const [circuitExplainLoading, setCircuitExplainLoading] = useState(false);
+  const [circuitExplainError, setCircuitExplainError] = useState<string | null>(null);
+
+  // --- Gene playground state ---
+  const [geneLibrary, setGeneLibrary] = useState<GeneLibrary | null>(null);
+  const [customParts, setCustomParts] = useState<ModelJson['parts']>([]);
+  const [customEdges, setCustomEdges] = useState<ModelJson['edges']>([]);
+  const [pickerSource, setPickerSource] = useState<'cello' | 'characterized'>('cello');
+  const [pickerChassis, setPickerChassis] = useState('Eco1C1G1T1');
+  const [pickerGate, setPickerGate] = useState('');
+  const [edgeFrom, setEdgeFrom] = useState('');
+  const [edgeTo, setEdgeTo] = useState('');
+  const [edgeType, setEdgeType] = useState<'repress' | 'activate'>('repress');
+
   useEffect(() => {
+    fetchWithTimeout(`${API_BASE}/gene_library`)
+      .then((r) => r.json())
+      .then((lib: GeneLibrary) => {
+        setGeneLibrary(lib);
+        const firstChassis = Object.keys(lib.cello)[0];
+        if (firstChassis) {
+          setPickerChassis(firstChassis);
+          setPickerGate(lib.cello[firstChassis][0] || '');
+        }
+      })
+      .catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    if (circuitName === 'custom') return;
     let cancelled = false;
     async function run() {
       setLoading(true);
@@ -156,14 +189,16 @@ function App() {
       setExplanation(null);
       setSubstitutionNote(null);
       setEditError(null);
+      setCircuitExplanation(null);
+      setCircuitExplainError(null);
       try {
-        const modelRes = await fetch(`${API_BASE}/circuits/${circuitName}`);
+        const modelRes = await fetchWithTimeout(`${API_BASE}/circuits/${circuitName}`);
         if (!modelRes.ok) throw new Error(`Failed to load circuit: ${modelRes.status}`);
         const model: ModelJson = await modelRes.json();
         if (cancelled) return;
         setCurrentModel(model);
 
-        const simRes = await fetch(`${API_BASE}/simulate?mode=${mode}`, {
+        const simRes = await fetchWithTimeout(`${API_BASE}/simulate?mode=${mode}`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(model),
@@ -181,6 +216,107 @@ function App() {
     return () => { cancelled = true; };
   }, [circuitName, mode]);
 
+  async function addGeneToCustom() {
+    const url = pickerSource === 'cello'
+      ? `${API_BASE}/gene_library/cello/${pickerChassis}/${pickerGate}`
+      : `${API_BASE}/gene_library/characterized/${pickerGate}`;
+    try {
+      const res = await fetchWithTimeout(url);
+      if (!res.ok) throw new Error(`Could not fetch gene: ${res.status}`);
+      const part = await res.json();
+      setCustomParts((prev) => (prev.some((p) => p.id === part.id) ? prev : [...prev, part]));
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Unknown error');
+    }
+  }
+
+  function addOutputNode() {
+    const n = customParts.filter((p) => p.id.startsWith('output')).length + 1;
+    const id = n === 1 ? 'output' : `output${n}`;
+    setCustomParts((prev) => [...prev, {
+      id, maxExpression: 100.0, basalExpression: 0.0, hillCoeff: 2.0, degradationRate: 2.0, halfMaxConst: 1.0,
+    }]);
+  }
+
+  function removeCustomPart(id: string) {
+    setCustomParts((prev) => prev.filter((p) => p.id !== id));
+    setCustomEdges((prev) => prev.filter((e) => e.from !== id && e.to !== id));
+  }
+
+  function addCustomEdge() {
+    if (!edgeFrom || !edgeTo || edgeFrom === edgeTo) return;
+    setCustomEdges((prev) => [...prev, { from: edgeFrom, to: edgeTo, type: edgeType }]);
+  }
+
+  function removeCustomEdge(idx: number) {
+    setCustomEdges((prev) => prev.filter((_, i) => i !== idx));
+  }
+
+  async function runCustomSimulation(modeOverride?: 'deterministic' | 'stochastic') {
+    if (customParts.length === 0) return;
+    const effectiveMode = modeOverride ?? mode;
+    const model: ModelJson = { parts: customParts, edges: customEdges };
+    setCurrentModel(model);
+    setLoading(true);
+    setError(null);
+    try {
+      const res = await fetchWithTimeout(`${API_BASE}/simulate?mode=${effectiveMode}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(model),
+      });
+      if (!res.ok) {
+        const data = await res.json().catch(() => null);
+        throw new Error(data?.detail || `Simulation failed: ${res.status}`);
+      }
+      setResult(await res.json());
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Unknown error');
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  function openPlayground() {
+    setResult(null);
+    setCurrentModel(null);
+    setError(null);
+    setExplanation(null);
+    setSubstitutionNote(null);
+    setEditError(null);
+    setCircuitExplanation(null);
+    setCircuitExplainError(null);
+    setCircuitName('custom');
+  }
+
+  function selectMode(newMode: 'deterministic' | 'stochastic') {
+    setMode(newMode);
+    if (circuitName === 'custom' && customParts.length > 0 && result) {
+      runCustomSimulation(newMode);
+    }
+  }
+
+  async function explainCurrentCircuit() {
+    if (!currentModel) return;
+    setCircuitExplainLoading(true);
+    setCircuitExplainError(null);
+    setCircuitExplanation(null);
+    try {
+      const res = await fetchWithTimeout(`${API_BASE}/explain_circuit?mode=${mode}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(currentModel),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || `Request failed: ${res.status}`);
+      setCircuitExplanation(data.explanation);
+    } catch (err) {
+      setCircuitExplainError(err instanceof Error ? err.message : 'Unknown error');
+    } finally {
+      setCircuitExplainLoading(false);
+    }
+  }
+
   async function handleEditSubmit() {
     if (!currentModel || !instruction.trim()) return;
     setEditLoading(true);
@@ -188,7 +324,7 @@ function App() {
     setExplanation(null);
     setSubstitutionNote(null);
     try {
-      const res = await fetch(`${API_BASE}/edit_and_explain`, {
+      const res = await fetchWithTimeout(`${API_BASE}/edit_and_explain`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ instruction, current_model: currentModel }),
@@ -207,11 +343,11 @@ function App() {
     }
   }
 
+  const downsampleStep = result ? Math.max(1, Math.floor(result.t.length / 2000)) : 1;
   const proteinSeries = result
     ? Object.keys(result.species).filter((k) => k.endsWith('_protein'))
     : [];
 
-  const downsampleStep = result ? Math.max(1, Math.floor(result.t.length / 2000)) : 1;
   const chartData = result
     ? result.t.filter((_, i) => i % downsampleStep === 0).map((t, i) => {
         const originalIndex = i * downsampleStep;
@@ -221,6 +357,11 @@ function App() {
         });
         return row;
       })
+    : [];
+
+  const isCustom = circuitName === 'custom';
+  const gateOptions = geneLibrary
+    ? (pickerSource === 'cello' ? geneLibrary.cello[pickerChassis] || [] : geneLibrary.characterized)
     : [];
 
   return (
@@ -252,17 +393,27 @@ function App() {
           ))}
         </nav>
 
-        <div style={{ fontSize: 11, color: 'var(--text-muted)', letterSpacing: '0.08em', marginTop: 32, marginBottom: 12, textTransform: 'uppercase' }}>
+        <div style={{ fontSize: 11, color: 'var(--text-muted)', letterSpacing: '0.08em', marginTop: 24, marginBottom: 12, textTransform: 'uppercase' }}>
+          Playground
+        </div>
+        <nav style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+          <button onClick={openPlayground} className={`nav-item ${isCustom ? 'nav-item-active' : ''}`}>
+            Build your own
+          </button>
+        </nav>
+
+        <div style={{ fontSize: 11, color: 'var(--text-muted)', letterSpacing: '0.08em', marginTop: 24, marginBottom: 12, textTransform: 'uppercase' }}>
           Solver mode
         </div>
         <nav style={{ display: 'flex', flexDirection: 'column', gap: 2, marginBottom: 'auto' }}>
-          <button onClick={() => setMode('deterministic')} className={`nav-item ${mode === 'deterministic' ? 'nav-item-active' : ''}`}>
+          <button onClick={() => selectMode('deterministic')} className={`nav-item ${mode === 'deterministic' ? 'nav-item-active' : ''}`}>
             Deterministic (ODE)
           </button>
-          <button onClick={() => setMode('stochastic')} className={`nav-item ${mode === 'stochastic' ? 'nav-item-active' : ''}`}>
+          <button onClick={() => selectMode('stochastic')} className={`nav-item ${mode === 'stochastic' ? 'nav-item-active' : ''}`}>
             Stochastic (Gillespie)
           </button>
         </nav>
+
         <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>
           Kernel v1 · repress / activate
         </div>
@@ -272,6 +423,107 @@ function App() {
         {loading && <p style={{ color: 'var(--text-secondary)' }}>Running simulation...</p>}
         {error && (
           <p style={{ color: '#ff8a8a' }}>{friendlyError(error)}</p>
+        )}
+
+        {isCustom && (
+          <div style={{
+            background: 'var(--surface)', border: '1px solid var(--border)', borderRadius: 10,
+            padding: '18px 20px', marginBottom: 20, maxWidth: 1400,
+          }}>
+            <div style={{ fontSize: 11, color: 'var(--text-muted)', letterSpacing: '0.08em', textTransform: 'uppercase', marginBottom: 14 }}>
+              Gene playground — real, cited genes only
+            </div>
+
+            <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', alignItems: 'center', marginBottom: 14 }}>
+              <select className="input-field" style={{ width: 160 }} value={pickerSource}
+                onChange={(e) => {
+                  const src = e.target.value as 'cello' | 'characterized';
+                  setPickerSource(src);
+                  if (src === 'characterized' && geneLibrary) setPickerGate(geneLibrary.characterized[0] || '');
+                }}>
+                <option value="cello">Cello UCF (85 gates)</option>
+                <option value="characterized">PMC7436927 (6 genes)</option>
+              </select>
+
+              {pickerSource === 'cello' && geneLibrary && (
+                <select className="input-field" style={{ width: 160 }} value={pickerChassis}
+                  onChange={(e) => {
+                    setPickerChassis(e.target.value);
+                    setPickerGate(geneLibrary.cello[e.target.value][0] || '');
+                  }}>
+                  {Object.keys(geneLibrary.cello).map((lib) => (
+                    <option key={lib} value={lib}>{lib}</option>
+                  ))}
+                </select>
+              )}
+
+              <select className="input-field" style={{ width: 180 }} value={pickerGate} onChange={(e) => setPickerGate(e.target.value)}>
+                {gateOptions.map((g) => <option key={g} value={g}>{g}</option>)}
+              </select>
+
+              <button className="btn-primary" onClick={addGeneToCustom}>Add gene</button>
+              <button className="btn-primary" onClick={addOutputNode} style={{ opacity: 0.85 }}>Add output node</button>
+            </div>
+
+            {customParts.length > 0 && (
+              <div style={{ marginBottom: 14 }}>
+                <div style={{ fontSize: 12, color: 'var(--text-secondary)', marginBottom: 6 }}>In circuit:</div>
+                <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+                  {customParts.map((p) => (
+                    <span key={p.id} style={{
+                      fontSize: 12, fontFamily: 'IBM Plex Mono, monospace', padding: '4px 10px',
+                      borderRadius: 6, background: 'var(--surface-sidebar)', border: '1px solid var(--border)',
+                      display: 'flex', alignItems: 'center', gap: 6,
+                    }}>
+                      {p.id}
+                      <button onClick={() => removeCustomPart(p.id as string)} style={{
+                        background: 'none', border: 'none', color: 'var(--text-muted)', cursor: 'pointer', fontSize: 13,
+                      }}>×</button>
+                    </span>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {customParts.length >= 2 && (
+              <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', alignItems: 'center', marginBottom: 14 }}>
+                <select className="input-field" style={{ width: 160 }} value={edgeFrom} onChange={(e) => setEdgeFrom(e.target.value)}>
+                  <option value="">from...</option>
+                  {customParts.map((p) => <option key={p.id} value={p.id as string}>{p.id}</option>)}
+                </select>
+                <select className="input-field" style={{ width: 130 }} value={edgeType} onChange={(e) => setEdgeType(e.target.value as 'repress' | 'activate')}>
+                  <option value="repress">represses</option>
+                  <option value="activate">activates</option>
+                </select>
+                <select className="input-field" style={{ width: 160 }} value={edgeTo} onChange={(e) => setEdgeTo(e.target.value)}>
+                  <option value="">to...</option>
+                  {customParts.map((p) => <option key={p.id} value={p.id as string}>{p.id}</option>)}
+                </select>
+                <button className="btn-primary" onClick={addCustomEdge}>Add edge</button>
+              </div>
+            )}
+
+            {customEdges.length > 0 && (
+              <div style={{ marginBottom: 14, display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+                {customEdges.map((e, i) => (
+                  <span key={i} style={{
+                    fontSize: 12, fontFamily: 'IBM Plex Mono, monospace', padding: '4px 10px',
+                    borderRadius: 6, background: 'var(--surface-sidebar)', border: '1px solid var(--border)',
+                    display: 'flex', alignItems: 'center', gap: 6,
+                  }}>
+                    {e.from} {e.type === 'repress' ? '⊣' : '→'} {e.to}
+                    <button onClick={() => removeCustomEdge(i)} style={{
+                      background: 'none', border: 'none', color: 'var(--text-muted)', cursor: 'pointer', fontSize: 13,
+                    }}>×</button>
+                  </span>
+                ))}
+              </div>
+            )}
+
+            <button className="btn-primary" onClick={() => runCustomSimulation()} disabled={customParts.length === 0}>
+              Simulate this circuit
+            </button>
+          </div>
         )}
 
         <div style={{
@@ -311,6 +563,22 @@ function App() {
               <ChartSkeleton />
             )}
           </div>
+        </div>
+
+        <div style={{ maxWidth: 800, marginBottom: 24 }}>
+          <button onClick={explainCurrentCircuit} disabled={circuitExplainLoading || !currentModel} className="btn-primary">
+            {circuitExplainLoading ? 'Analyzing...' : 'Explain these results'}
+          </button>
+          {circuitExplainError && <p style={{ color: '#ff8a8a', marginTop: 14, fontSize: 14 }}>{friendlyError(circuitExplainError)}</p>}
+          {circuitExplanation && (
+            <div style={{
+              marginTop: 16, padding: '14px 18px', borderRadius: 8,
+              background: '#0f1a20', border: '1px solid #1e3a45', color: '#d5e6ec',
+              fontSize: 14, lineHeight: 1.65,
+            }}>
+              {circuitExplanation}
+            </div>
+          )}
         </div>
 
         <div style={{ maxWidth: 800 }}>
