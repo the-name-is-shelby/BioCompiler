@@ -28,7 +28,36 @@ MECHANISM_DEFAULTS = {
 }
 
 WHITELISTED_MECHANISMS = {"repress", "activate"}
-
+# --- Degradation-tagging (ssrA/ClpXP shared-queue) mechanism ---
+# Source: Cookson NA, Mather WH, Danino T, Mondragón-Palomino O, Williams RJ,
+# Tsimring LS, Hasty J (2011). "Queueing up for enzymatic processing:
+# correlated signaling through coupled degradation." Mol Syst Biol 7:561.
+# PMID 22186735. Curated model: BioModels BIOMD0000000405.
+#
+# The curated model is full mass-action (binding + catalysis), not a
+# pre-reduced equation: Kp=1000 (binding rate), mu=10 (catalytic turnover),
+# E_total=100 (total ClpXP pool, conserved). Since Kp >> mu (binding
+# equilibrates ~100x faster than catalysis), the standard quasi-steady-state
+# reduction (textbook enzymology, not a guess) collapses this to the
+# classic saturable shared-queue form:
+#
+#   degradation_rate(gene_i) = (Vmax * protein_i) /
+#                               (Km + sum of protein_j over every
+#                                degradation-tagged gene j in the circuit,
+#                                including gene_i itself)
+#
+#   where Vmax = mu * E_total, Km = mu / Kp   (both directly from the model)
+#
+# UNIT NOTE (documented, not hidden): the curated SBML model is
+# dimensionless — no physical units given — so Vmax/Km below are RESCALED
+# to sit in this app's existing parameter range (maxExpression/
+# degradationRate, sourced from the real dimensioned Kim/Zhang 2020 data),
+# preserving the paper's qualitative saturation behavior. This rescaling
+# is a judgment call, unlike the functional form and the Kp>>mu structure
+# above, which are directly from the cited, curated model.
+DEGRADATION_TAG_VMAX = 1000.0   # mu * E_total, rescaled
+DEGRADATION_TAG_KM = 50.0       # rescaled so saturation is visible once
+                                 # 1-2 tagged genes reach normal expression
 
 @dataclass
 class PartInstance:
@@ -38,6 +67,7 @@ class PartInstance:
     hillCoeff: float = 2.0
     degradationRate: float = 5.0
     halfMaxConst: float = 1.0
+    degradationTag: bool = False
 
 
 @dataclass

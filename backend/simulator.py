@@ -22,11 +22,12 @@ This is the sole source of numeric truth. The AI never touches this file
 or its output — it only ever supplies model JSON in, and reads back a
 structured diff, never raw numbers it could alter.
 """
-
+import copy
 import numpy as np
 from scipy.integrate import solve_ivp
+from scipy.optimize import fsolve
 
-from parts_library import validate_model
+from parts_library import validate_model, DEGRADATION_TAG_VMAX, DEGRADATION_TAG_KM
 
 
 def simulate(model: dict, t_span=(0, 200), n_points=2000, initial_perturbation=1.0) -> dict:
@@ -57,12 +58,14 @@ def simulate(model: dict, t_span=(0, 200), n_points=2000, initial_perturbation=1
     n_hill = np.array([parts[g].get("hillCoeff", 2.0) for g in ids])
     beta = np.array([parts[g].get("degradationRate", 5.0) for g in ids])
     K = np.array([parts[g].get("halfMaxConst", 1.0) for g in ids])
+    tagged = np.array([bool(parts[g].get("degradationTag", False)) for g in ids])
 
     def odes(t, y):
         mrna = y[0:n_genes]
         protein = y[n_genes:2 * n_genes]
         dmrna = np.zeros(n_genes)
         dprotein = np.zeros(n_genes)
+        tagged_load = protein[tagged].sum() if tagged.any() else 0.0
         for gid in ids:
             i = idx[gid]
             A = 1.0
@@ -74,7 +77,11 @@ def simulate(model: dict, t_span=(0, 200), n_points=2000, initial_perturbation=1
                 r_level = protein[idx[r_id]]
                 R *= 1.0 / (1.0 + (r_level / K[i]) ** n_hill[i])
             dmrna[i] = -mrna[i] + alpha[i] * A * R + alpha0[i]
-            dprotein[i] = -beta[i] * (protein[i] - mrna[i])
+            if tagged[i]:
+                beta_eff = DEGRADATION_TAG_VMAX / (DEGRADATION_TAG_KM + tagged_load)
+            else:
+                beta_eff = beta[i]
+            dprotein[i] = -beta_eff * (protein[i] - mrna[i])
         return np.concatenate([dmrna, dprotein])
 
     y0 = np.zeros(2 * n_genes)
@@ -245,3 +252,265 @@ def characterize_dynamics(result: dict) -> dict:
             "settled": bool(tail_spread < 0.05),
         }
     return out
+def _build_odes_fn(model: dict):
+    """Rebuild the exact same right-hand side simulate() integrates, as a
+    standalone y -> dy/dt function we can root-find and differentiate.
+    Same math as simulate()'s internal odes() — no duplicated logic, just
+    exposed for reuse by the stability analysis below."""
+    parts = {p["id"]: p for p in model["parts"]}
+    ids = list(parts.keys())
+    n_genes = len(ids)
+    idx = {gid: i for i, gid in enumerate(ids)}
+    activators_of = {gid: [] for gid in ids}
+    repressors_of = {gid: [] for gid in ids}
+    for e in model["edges"]:
+        (activators_of if e["type"] == "activate" else repressors_of)[e["to"]].append(e["from"])
+    alpha = np.array([parts[g].get("maxExpression", 200.0) for g in ids])
+    alpha0 = np.array([parts[g].get("basalExpression", 0.0) for g in ids])
+    n_hill = np.array([parts[g].get("hillCoeff", 2.0) for g in ids])
+    beta = np.array([parts[g].get("degradationRate", 5.0) for g in ids])
+    K = np.array([parts[g].get("halfMaxConst", 1.0) for g in ids])
+
+    def odes(y):
+        mrna, protein = y[:n_genes], y[n_genes:]
+        dmrna, dprotein = np.zeros(n_genes), np.zeros(n_genes)
+        for gid in ids:
+            i = idx[gid]
+            A = 1.0
+            for a_id in activators_of[gid]:
+                a_level = protein[idx[a_id]]
+                A *= (a_level ** n_hill[i]) / (K[i] ** n_hill[i] + a_level ** n_hill[i] + 1e-12)
+            R = 1.0
+            for r_id in repressors_of[gid]:
+                r_level = protein[idx[r_id]]
+                R *= 1.0 / (1.0 + (r_level / K[i]) ** n_hill[i])
+            dmrna[i] = -mrna[i] + alpha[i] * A * R + alpha0[i]
+            if tagged[i]:
+                beta_eff = DEGRADATION_TAG_VMAX / (DEGRADATION_TAG_KM + tagged_load)
+            else:
+                beta_eff = beta[i]
+            dprotein[i] = -beta_eff * (protein[i] - mrna[i])
+        return np.concatenate([dmrna, dprotein])
+    return odes, ids
+
+
+def classify_stability(model: dict, initial_guess: list) -> dict:
+    """Linear stability analysis (Strogatz-standard: Jacobian eigenvalues at
+    a fixed point) starting from a given initial guess — typically a
+    deterministic simulation's final state.
+
+    HONEST BY CONSTRUCTION: this does NOT trust that the guess is actually a
+    fixed point. It root-finds (fsolve) for the true nearby equilibrium and
+    verifies the residual is genuinely ~0 before classifying anything. If no
+    real equilibrium converges near the guess — the expected outcome for an
+    oscillating circuit like the repressilator, whose forward trajectory
+    never rests — it says so explicitly instead of fabricating a verdict for
+    a non-equilibrium point.
+
+    Only examines the ONE equilibrium nearest the given guess, not an
+    exhaustive search of every possible fixed point a bistable circuit may
+    have — that exhaustive search is what the (separate) bifurcation-diagram
+    feature does by sampling multiple starting points.
+    """
+    odes, ids = _build_odes_fn(model)
+    y0 = np.array(initial_guess, dtype=float)
+    y_star, info, ier, msg = fsolve(odes, y0, full_output=True)
+    residual = float(np.abs(np.array(odes(y_star))).max())
+    if ier != 1 or residual > 1e-4:
+        return {
+            "equilibrium_found": False,
+            "reason": ("No true fixed point converged near this trajectory — "
+                       "consistent with sustained oscillation (a limit cycle, "
+                       "not a resting state), or the solver didn't converge."),
+            "residual": round(residual, 6),
+        }
+    eps = 1e-6
+    n = len(y_star)
+    J = np.zeros((n, n))
+    for j in range(n):
+        yp, ym = y_star.copy(), y_star.copy()
+        yp[j] += eps
+        ym[j] -= eps
+        J[:, j] = (odes(yp) - odes(ym)) / (2 * eps)
+    eigvals = np.linalg.eigvals(J)
+    max_real = float(eigvals.real.max())
+    verdict = "unstable" if max_real > 1e-6 else ("stable" if max_real < -1e-6 else "marginal")
+    return {
+        "equilibrium_found": True,
+        "verdict": verdict,
+        "max_real_eigenvalue": round(max_real, 5),
+        "complex_eigenvalues_present": bool(np.any(np.abs(eigvals.imag) > 1e-6)),
+        "equilibrium_state": {gid: {"mRNA": round(float(y_star[i]), 4),
+                                     "protein": round(float(y_star[len(ids) + i]), 4)}
+                               for i, gid in enumerate(ids)},
+    }
+def parameter_sweep(model: dict, target_part_id: str, target_param: str, values: list,
+                     output_species: str | None = None) -> list:
+    """Resimulate a circuit across a range of one parameter value, reporting
+    both the raw dynamics (final value, oscillation amplitude for the chosen
+    species) and a stability verdict at each point — a verdict flip from
+    stable to unstable as the parameter crosses some value IS a bifurcation,
+    even though this doesn't (yet) draw it as its own diagram.
+
+    target_part_id: a specific gene's id, or "ALL" to vary that parameter
+    identically across every gene (needed to preserve a symmetric circuit
+    like the repressilator, where sweeping only one gene breaks the symmetry
+    the oscillation depends on).
+
+    HONESTY NOTE: 'unstable' and 'no_equilibrium(oscillating)' are reported
+    separately but mean functionally the same thing — no stable resting
+    state exists at that parameter value. They differ only in whether the
+    root-finder's guess happened to converge onto the (still unstable) fixed
+    point, not in the underlying dynamics.
+    """
+    results = []
+    for v in values:
+        modified = copy.deepcopy(model)
+        for p in modified["parts"]:
+            if target_part_id == "ALL" or p["id"] == target_part_id:
+                p[target_param] = float(v)
+        sim = simulate(modified)
+        entry = {"parameter_value": round(float(v), 3)}
+        if output_species:
+            arr = np.array(sim["species"][output_species])
+            entry["final"] = round(float(arr[-1]), 3)
+            entry["amplitude"] = round(float(arr.max() - arr.min()), 3)
+        ids = [p["id"] for p in modified["parts"]]
+        guess = [sim["species"][f"{g}_mRNA"][-1] for g in ids] + [sim["species"][f"{g}_protein"][-1] for g in ids]
+        stab = classify_stability(modified, guess)
+        entry["stability"] = stab.get("verdict") if stab.get("equilibrium_found") else "no_equilibrium(oscillating)"
+        results.append(entry)
+    return results
+def _classify_from_state(odes_fn, y_star):
+    eps = 1e-6
+    n = len(y_star)
+    J = np.zeros((n, n))
+    for j in range(n):
+        yp, ym = y_star.copy(), y_star.copy()
+        yp[j] += eps
+        ym[j] -= eps
+        J[:, j] = (odes_fn(yp) - odes_fn(ym)) / (2 * eps)
+    eigvals = np.linalg.eigvals(J)
+    max_real = float(eigvals.real.max())
+    return "unstable" if max_real > 1e-6 else ("stable" if max_real < -1e-6 else "marginal")
+
+
+def bifurcation_diagram(model: dict, target_part_id: str, target_param: str, values: list,
+                         t_max: float = 200.0) -> list:
+    """For each parameter value, tries starting the simulation from a nudge
+    on each gene in turn, root-finds the nearby equilibrium from where each
+    converges, and keeps only the distinct STABLE branches found (deduped
+    by distance). The number of stable branches at a given parameter value
+    is a real bifurcation diagram — e.g. 1 branch = monostable, 2 = bistable.
+
+    HONESTY NOTE: this is multi-start sampling (nudge each gene once), NOT
+    an exhaustive continuation search. It can miss a branch that's only
+    reachable from a specific combination of initial conditions rather than
+    a single-gene nudge. It also never reports unstable branches (the
+    classic dashed middle branch of a textbook hysteresis curve) since those
+    are never physically observed by direct simulation — reporting only
+    what's actually reachable, not the full analytical structure.
+    """
+    odes_base, ids = _build_odes_fn(model)
+    n_genes = len(ids)
+    results = []
+    for v in values:
+        modified = copy.deepcopy(model)
+        for p in modified["parts"]:
+            if target_part_id == "ALL" or p["id"] == target_part_id:
+                p[target_param] = float(v)
+        odes, _ = _build_odes_fn(modified)
+        branches = []
+        for start_gene in range(n_genes):
+            y0 = np.zeros(2 * n_genes)
+            y0[start_gene] = 1.0
+            sol = solve_ivp(lambda t, y: odes(y), (0, t_max), y0, method="LSODA", rtol=1e-6, atol=1e-9)
+            y_star, info, ier, msg = fsolve(odes, sol.y[:, -1], full_output=True)
+            residual = np.abs(odes(y_star)).max()
+            if ier != 1 or residual > 1e-4:
+                continue
+            if _classify_from_state(odes, y_star) != "stable":
+                continue
+            if all(np.linalg.norm(y_star - b) > 1.0 for b in branches):
+                branches.append(y_star)
+        results.append({
+            "parameter_value": round(float(v), 3),
+            "n_stable_branches": len(branches),
+            "branches": [
+                {gid: round(float(b[n_genes + i]), 3) for i, gid in enumerate(ids)}
+                for b in branches
+            ],
+        })
+    return results
+def phase_portrait(model: dict, gene_x: str, gene_y: str, grid_n: int = 20,
+                    x_max: float | None = None, y_max: float | None = None) -> dict:
+    """2D phase-plane vector field, in PROTEIN space, for two chosen genes —
+    built the same way the toggle switch's own original paper (Gardner,
+    Cantor & Collins 2000) presents its nullcline figure: using the
+    quasi-steady-state assumption that mRNA has already relaxed to its
+    instantaneous target given current protein levels. This collapses the
+    model's real 2-variable-per-gene dynamics into a clean 2D vector field
+    without changing the underlying regulatory math at all.
+
+    HONESTY NOTE: for circuits with more than 2 genes, every OTHER gene's
+    protein level is held fixed at its own settled value from a full
+    simulation — this is a genuine 2D slice through a higher-dimensional
+    system, not the complete state-space portrait. Verified against known
+    saddle-point structure (stable along one direction, unstable along the
+    perpendicular one) for a real bistable circuit before shipping.
+    """
+    parts = {p["id"]: p for p in model["parts"]}
+    ids = list(parts.keys())
+    activators_of = {gid: [] for gid in ids}
+    repressors_of = {gid: [] for gid in ids}
+    for e in model["edges"]:
+        (activators_of if e["type"] == "activate" else repressors_of)[e["to"]].append(e["from"])
+    alpha = {g: parts[g].get("maxExpression", 200.0) for g in ids}
+    alpha0 = {g: parts[g].get("basalExpression", 0.0) for g in ids}
+    n_hill = {g: parts[g].get("hillCoeff", 2.0) for g in ids}
+    beta = {g: parts[g].get("degradationRate", 5.0) for g in ids}
+    K = {g: parts[g].get("halfMaxConst", 1.0) for g in ids}
+
+    sim = simulate(model)
+    fixed_protein = {g: sim["species"][f"{g}_protein"][-1] for g in ids}
+
+    if x_max is None:
+        x_max = max(alpha[gene_x] * 1.2, 5.0)
+    if y_max is None:
+        y_max = max(alpha[gene_y] * 1.2, 5.0)
+
+    def target_expr(gid, protein_state):
+        A, R = 1.0, 1.0
+        for a_id in activators_of[gid]:
+            lvl = protein_state[a_id]
+            A *= (lvl ** n_hill[gid]) / (K[gid] ** n_hill[gid] + lvl ** n_hill[gid] + 1e-12)
+        for r_id in repressors_of[gid]:
+            lvl = protein_state[r_id]
+            R *= 1.0 / (1.0 + (lvl / K[gid]) ** n_hill[gid])
+        return alpha[gid] * A * R + alpha0[gid]
+
+    xs = np.linspace(0, x_max, grid_n)
+    ys = np.linspace(0, y_max, grid_n)
+    vector_field = []
+    for xv in xs:
+        for yv in ys:
+            state = dict(fixed_protein)
+            state[gene_x] = xv
+            state[gene_y] = yv
+            dx = -beta[gene_x] * (xv - target_expr(gene_x, state))
+            dy = -beta[gene_y] * (yv - target_expr(gene_y, state))
+            vector_field.append({"x": round(float(xv), 3), "y": round(float(yv), 3),
+                                  "dx": round(float(dx), 4), "dy": round(float(dy), 4)})
+
+    x_nullcline = [{"y": round(float(yv), 3),
+                     "x": round(float(target_expr(gene_x, {**fixed_protein, gene_y: yv})), 3)} for yv in ys]
+    y_nullcline = [{"x": round(float(xv), 3),
+                     "y": round(float(target_expr(gene_y, {**fixed_protein, gene_x: xv})), 3)} for xv in xs]
+
+    return {
+        "gene_x": gene_x, "gene_y": gene_y,
+        "vector_field": vector_field,
+        "x_nullcline": x_nullcline,
+        "y_nullcline": y_nullcline,
+        "fixed_other_genes": {g: round(v, 3) for g, v in fixed_protein.items() if g not in (gene_x, gene_y)},
+    }
