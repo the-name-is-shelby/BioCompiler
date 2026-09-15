@@ -47,8 +47,11 @@ def simulate(model: dict, t_span=(0, 200), n_points=2000, initial_perturbation=1
 
     activators_of = {gid: [] for gid in ids}
     repressors_of = {gid: [] for gid in ids}
+    sequestered_by = {gid: [] for gid in ids}
     for e in model["edges"]:
-        if e["type"] == "activate":
+        if e["type"] == "sequester":
+            sequestered_by[e["to"]].append(e["from"])
+        elif e["type"] == "activate":
             activators_of[e["to"]].append(e["from"])
         else:
             repressors_of[e["to"]].append(e["from"])
@@ -65,23 +68,22 @@ def simulate(model: dict, t_span=(0, 200), n_points=2000, initial_perturbation=1
         protein = y[n_genes:2 * n_genes]
         dmrna = np.zeros(n_genes)
         dprotein = np.zeros(n_genes)
-        tagged_load = protein[tagged].sum() if tagged.any() else 0.0
+        free_protein = protein.copy()
+        for gid in ids:
+            for inhib_id in sequestered_by[gid]:
+                free_protein[idx[gid]] = max(free_protein[idx[gid]] - protein[idx[inhib_id]], 0.0)
         for gid in ids:
             i = idx[gid]
             A = 1.0
             for a_id in activators_of[gid]:
-                a_level = protein[idx[a_id]]
+                a_level = free_protein[idx[a_id]]
                 A *= (a_level ** n_hill[i]) / (K[i] ** n_hill[i] + a_level ** n_hill[i] + 1e-12)
             R = 1.0
             for r_id in repressors_of[gid]:
-                r_level = protein[idx[r_id]]
+                r_level = free_protein[idx[r_id]]
                 R *= 1.0 / (1.0 + (r_level / K[i]) ** n_hill[i])
             dmrna[i] = -mrna[i] + alpha[i] * A * R + alpha0[i]
-            if tagged[i]:
-                beta_eff = DEGRADATION_TAG_VMAX / (DEGRADATION_TAG_KM + tagged_load)
-            else:
-                beta_eff = beta[i]
-            dprotein[i] = -beta_eff * (protein[i] - mrna[i])
+            dprotein[i] = -beta[i] * (protein[i] - mrna[i])
         return np.concatenate([dmrna, dprotein])
 
     y0 = np.zeros(2 * n_genes)

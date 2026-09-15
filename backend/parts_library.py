@@ -27,7 +27,14 @@ MECHANISM_DEFAULTS = {
     "activate": {"alpha": 200.0, "alpha0": 0.0, "n": 2.0, "beta": 5.0, "K": 1.0},
 }
 
-WHITELISTED_MECHANISMS = {"repress", "activate"}
+# --- Sequestration mechanism ---
+# Source: Buchler NE, Cross FR (2009). "Protein sequestration generates a
+# flexible ultrasensitive response in a genetic network." Mol Syst Biol 5:272.
+# High-affinity binding (measured Kd~0.04 nM) justifies the stoichiometric
+# limit used directly in the paper: free active protein A_free = A_total -
+# B_total (clipped at 0), i.e. the inhibitor titrates A 1:1 before any is
+# left to bind DNA. New edge type: "sequester" (inhibitor -> target).
+WHITELISTED_MECHANISMS = {"repress", "activate", "sequester"}
 # --- Degradation-tagging (ssrA/ClpXP shared-queue) mechanism ---
 # Source: Cookson NA, Mather WH, Danino T, Mondragón-Palomino O, Williams RJ,
 # Tsimring LS, Hasty J (2011). "Queueing up for enzymatic processing:
