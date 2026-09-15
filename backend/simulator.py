@@ -156,6 +156,7 @@ def simulate_gillespie(model: dict, t_max: float = 200.0, max_events: int = 400_
     n_hill = np.array([parts[g].get("hillCoeff", 2.0) for g in ids])
     beta = np.array([parts[g].get("degradationRate", 5.0) for g in ids])
     K = np.array([parts[g].get("halfMaxConst", 1.0) for g in ids])
+    tagged = np.array([bool(parts[g].get("degradationTag", False)) for g in ids])
 
     mrna = np.zeros(n_genes)
     protein = np.zeros(n_genes)
@@ -185,9 +186,11 @@ def simulate_gillespie(model: dict, t_max: float = 200.0, max_events: int = 400_
                 r_level = protein[idx[r_id]]
                 R *= 1.0 / (1.0 + (r_level / K[i]) ** n_hill[i])
             rates[i] = max(alpha[i] * A * R + alpha0[i], 0.0)
+        tagged_load = protein[tagged].sum() if tagged.any() else 0.0
+        beta_eff = np.where(tagged, DEGRADATION_TAG_VMAX / (DEGRADATION_TAG_KM + tagged_load), beta)
         rates[n_genes:2*n_genes] = mrna
-        rates[2*n_genes:3*n_genes] = beta * mrna
-        rates[3*n_genes:4*n_genes] = beta * protein
+        rates[2*n_genes:3*n_genes] = beta_eff * mrna
+        rates[3*n_genes:4*n_genes] = beta_eff * protein
 
         a0 = rates.sum()
         if a0 <= 0:
@@ -265,15 +268,17 @@ def _build_odes_fn(model: dict):
     repressors_of = {gid: [] for gid in ids}
     for e in model["edges"]:
         (activators_of if e["type"] == "activate" else repressors_of)[e["to"]].append(e["from"])
-    alpha = np.array([parts[g].get("maxExpression", 200.0) for g in ids])
+        alpha = np.array([parts[g].get("maxExpression", 200.0) for g in ids])
     alpha0 = np.array([parts[g].get("basalExpression", 0.0) for g in ids])
     n_hill = np.array([parts[g].get("hillCoeff", 2.0) for g in ids])
     beta = np.array([parts[g].get("degradationRate", 5.0) for g in ids])
     K = np.array([parts[g].get("halfMaxConst", 1.0) for g in ids])
+    tagged = np.array([bool(parts[g].get("degradationTag", False)) for g in ids])
 
     def odes(y):
         mrna, protein = y[:n_genes], y[n_genes:]
         dmrna, dprotein = np.zeros(n_genes), np.zeros(n_genes)
+        tagged_load = protein[tagged].sum() if tagged.any() else 0.0
         for gid in ids:
             i = idx[gid]
             A = 1.0
@@ -285,10 +290,7 @@ def _build_odes_fn(model: dict):
                 r_level = protein[idx[r_id]]
                 R *= 1.0 / (1.0 + (r_level / K[i]) ** n_hill[i])
             dmrna[i] = -mrna[i] + alpha[i] * A * R + alpha0[i]
-            if tagged[i]:
-                beta_eff = DEGRADATION_TAG_VMAX / (DEGRADATION_TAG_KM + tagged_load)
-            else:
-                beta_eff = beta[i]
+            beta_eff = DEGRADATION_TAG_VMAX / (DEGRADATION_TAG_KM + tagged_load) if tagged[i] else beta[i]
             dprotein[i] = -beta_eff * (protein[i] - mrna[i])
         return np.concatenate([dmrna, dprotein])
     return odes, ids
