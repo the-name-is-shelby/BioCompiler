@@ -163,3 +163,107 @@ def explain_circuit(model: dict, characterization: dict) -> str:
         config=types.GenerateContentConfig(system_instruction=EXPLAIN_CIRCUIT_SYSTEM_PROMPT),
     )
     return response.text
+
+# ---------------------------------------------------------------------------
+# Multi-agent review. Two specialists look at the SAME real solver output
+# from two different lenses, independently (neither sees the other's text),
+# then a third agent (Arbiter) synthesizes both into one final verdict.
+# Every agent only ever sees real computed numbers or the real model JSON —
+# never asked to invent a fact about the circuit.
+# ---------------------------------------------------------------------------
+
+AGENT_PHYSIOLOGIST_SYSTEM_PROMPT = """You are the CIRCUIT PHYSIOLOGIST, one of two specialist reviewers
+analyzing a simulated gene circuit. Your lens is system-dynamics behavior only: whether the
+circuit settles or oscillates, and what the stability classification implies for the circuit's
+real-world reliability.
+
+You will be given the circuit's structure and a real numeric summary from an ODE solver:
+per-gene final/max/min/mean values, whether each species settled, and a stability classification
+(equilibrium found or not; if found, stable/unstable/marginal with its eigenvalue). You have not
+seen raw traces or the circuit's raw kinetic parameters — that is the other agent's job.
+
+In 2-4 plain sentences, give your independent verdict: is the observed dynamic behavior consistent
+with what the circuit's wiring suggests it should do, and what dynamics-specific risk (if any)
+would you flag. Reference only numbers given to you. Never invent a number. Do not comment on
+parameter values or biological plausibility — that is the other agent's job.
+
+Write in plain sentences only, no markdown."""
+
+AGENT_ARCHITECT_SYSTEM_PROMPT = """You are the CIRCUIT ARCHITECT, one of two specialist reviewers analyzing
+a simulated gene circuit. Your lens is the circuit's own kinetic parameters only: each gene's
+maxExpression, basalExpression, hillCoeff, degradationRate and halfMaxConst, as given directly in
+the model. You are comparing genes within this SAME circuit against each other to flag any
+parameter that stands out as an outlier relative to the rest of the circuit, and reasoning about
+what that outlier would predict for behavior (e.g. a much slower degradation rate than its
+neighbors makes a gene the slow node in the loop; a much higher Hill coefficient makes its
+response sharper/more switch-like than the others). You have not seen the solver's stability
+verdict or trace summary — that is the other agent's job.
+
+In 2-4 plain sentences, give your independent verdict: are the parameters internally consistent
+for this circuit's apparent purpose, and what design-specific risk (if any) would you flag.
+Reference only the parameter values given to you. Never invent a number or a value you were not
+given. Do not comment on the observed stability or trace outcome — that is the other agent's job.
+
+Write in plain sentences only, no markdown."""
+
+AGENT_ARBITER_SYSTEM_PROMPT = """You are the ARBITER. Two specialists — a Physiologist
+and an Architect — have each independently reviewed the same circuit from different angles and
+have NOT seen each other's text. You are given both of their written assessments, plus the same
+real numeric summary the Physiologist saw.
+
+In 3-5 plain sentences, produce ONE final verdict: state plainly whether the two assessments agree
+or point in the same direction. If they raise different or conflicting concerns, say so explicitly,
+state which one is the higher-priority risk and why, then give the single combined recommendation
+a user should act on. Reference only facts and numbers present in what you were given — you have
+no independent access to the circuit. Never invent a number.
+
+Write in plain sentences only, no markdown."""
+
+
+def agent_physiologist_review(model: dict, characterization: dict, stability: dict) -> str:
+    payload = {
+        "structure": {"parts": [p["id"] for p in model["parts"]], "edges": model["edges"]},
+        "characterization": characterization,
+        "stability": stability,
+    }
+    response = client.models.generate_content(
+        model="gemini-3.6-flash",
+        contents=json.dumps(payload),
+        config=types.GenerateContentConfig(system_instruction=AGENT_PHYSIOLOGIST_SYSTEM_PROMPT),
+    )
+    return response.text
+
+
+def agent_architect_review(model: dict) -> str:
+    params = [
+        {
+            "id": p["id"],
+            "maxExpression": p.get("maxExpression"),
+            "basalExpression": p.get("basalExpression"),
+            "hillCoeff": p.get("hillCoeff"),
+            "degradationRate": p.get("degradationRate"),
+            "halfMaxConst": p.get("halfMaxConst"),
+        }
+        for p in model["parts"]
+    ]
+    payload = {"structure": {"edges": model["edges"]}, "parameters": params}
+    response = client.models.generate_content(
+        model="gemini-3.6-flash",
+        contents=json.dumps(payload),
+        config=types.GenerateContentConfig(system_instruction=AGENT_ARCHITECT_SYSTEM_PROMPT),
+    )
+    return response.text
+
+
+def agent_arbiter_verdict(physiologist_review: str, architect_review: str, characterization: dict) -> str:
+    payload = {
+        "physiologist_review": physiologist_review,
+        "architect_review": architect_review,
+        "numeric_summary": characterization,
+    }
+    response = client.models.generate_content(
+        model="gemini-3.6-flash",
+        contents=json.dumps(payload),
+        config=types.GenerateContentConfig(system_instruction=AGENT_ARBITER_SYSTEM_PROMPT),
+    )
+    return response.text

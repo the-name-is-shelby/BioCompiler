@@ -14,8 +14,11 @@ from parts_library import (
     CELLO_UCF_LIBRARIES,
     REAL_CHARACTERIZED_PARTS,
 )
-from simulator import simulate, simulate_gillespie, diff_traces, characterize_dynamics
-from ai_operator import edit_circuit, explain_diff, explain_circuit
+from simulator import simulate, simulate_gillespie, diff_traces, characterize_dynamics, classify_stability, parameter_sweep, bifurcation_diagram, phase_portrait
+from ai_operator import (
+    edit_circuit, explain_diff, explain_circuit,
+    agent_physiologist_review, agent_architect_review, agent_arbiter_verdict,
+)
 
 app = FastAPI(title="BioCompiler API")
 
@@ -159,3 +162,121 @@ def explain_circuit_endpoint(model: ModelRequest, mode: str = "deterministic"):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Explain failed: {e}")
     return {"explanation": explanation, "characterization": characterization}
+@app.post("/stability")
+def stability_endpoint(model: ModelRequest):
+    model_dict = model.model_dump()
+    ok, msg = validate_model(model_dict)
+    if not ok:
+        raise HTTPException(status_code=400, detail=f"Model rejected by whitelist: {msg}")
+    try:
+        sim = simulate(model_dict)
+        ids = [p["id"] for p in model_dict["parts"]]
+        guess = [sim["species"][f"{g}_mRNA"][-1] for g in ids] + \
+                [sim["species"][f"{g}_protein"][-1] for g in ids]
+        result = classify_stability(model_dict, guess)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Stability analysis failed: {e}")
+    return result
+class SweepRequest(BaseModel):
+    model: ModelRequest
+    target_part_id: str
+    target_param: str
+    values: list[float]
+    output_species: str | None = None
+
+
+@app.post("/sensitivity_sweep")
+def sensitivity_sweep_endpoint(req: SweepRequest):
+    model_dict = req.model.model_dump()
+    ok, msg = validate_model(model_dict)
+    if not ok:
+        raise HTTPException(status_code=400, detail=f"Model rejected by whitelist: {msg}")
+    try:
+        result = parameter_sweep(model_dict, req.target_part_id, req.target_param, req.values, req.output_species)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Sweep failed: {e}")
+    return {"sweep": result}
+
+@app.post("/bifurcation_diagram")
+def bifurcation_diagram_endpoint(req: SweepRequest):
+    model_dict = req.model.model_dump()
+    ok, msg = validate_model(model_dict)
+    if not ok:
+        raise HTTPException(status_code=400, detail=f"Model rejected by whitelist: {msg}")
+    try:
+        result = bifurcation_diagram(model_dict, req.target_part_id, req.target_param, req.values)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Bifurcation analysis failed: {e}")
+    return {"bifurcation": result}
+
+class PhasePortraitRequest(BaseModel):
+    model: ModelRequest
+    gene_x: str
+    gene_y: str
+    grid_n: int = 20
+
+
+@app.post("/phase_portrait")
+def phase_portrait_endpoint(req: PhasePortraitRequest):
+    model_dict = req.model.model_dump()
+    ok, msg = validate_model(model_dict)
+    if not ok:
+        raise HTTPException(status_code=400, detail=f"Model rejected by whitelist: {msg}")
+    try:
+        result = phase_portrait(model_dict, req.gene_x, req.gene_y, req.grid_n)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Phase portrait failed: {e}")
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Agentic review — 3 endpoints, so the frontend calls them in sequence and
+# shows each agent's real completion as it happens. Physiologist and
+# Architect are independent; Arbiter runs last, taking both outputs.
+# ---------------------------------------------------------------------------
+
+@app.post("/agent_review/physiologist")
+def agent_review_physiologist(model: ModelRequest):
+    model_dict = model.model_dump()
+    ok, msg = validate_model(model_dict)
+    if not ok:
+        raise HTTPException(status_code=400, detail=f"Model rejected by whitelist: {msg}")
+    try:
+        sim = simulate(model_dict)
+        characterization = characterize_dynamics(sim)
+        ids = [p["id"] for p in model_dict["parts"]]
+        guess = [sim["species"][f"{g}_mRNA"][-1] for g in ids] + \
+                [sim["species"][f"{g}_protein"][-1] for g in ids]
+        stability = classify_stability(model_dict, guess)
+        review = agent_physiologist_review(model_dict, characterization, stability)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Physiologist review failed: {e}")
+    return {"characterization": characterization, "stability": stability, "review": review}
+
+
+@app.post("/agent_review/architect")
+def agent_review_architect(model: ModelRequest):
+    model_dict = model.model_dump()
+    ok, msg = validate_model(model_dict)
+    if not ok:
+        raise HTTPException(status_code=400, detail=f"Model rejected by whitelist: {msg}")
+    try:
+        review = agent_architect_review(model_dict)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Architect review failed: {e}")
+    return {"review": review}
+
+
+class ArbiterRequest(BaseModel):
+    physiologist_review: str
+    architect_review: str
+    characterization: dict
+
+
+@app.post("/agent_review/arbiter")
+def agent_review_arbiter(req: ArbiterRequest):
+    try:
+        verdict = agent_arbiter_verdict(req.physiologist_review, req.architect_review, req.characterization)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Arbiter failed: {e}")
+    return {"verdict": verdict}

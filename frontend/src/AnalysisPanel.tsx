@@ -23,6 +23,7 @@ type PhasePortrait = {
   y_nullcline: NullPoint[];
   fixed_other_genes: Record<string, number>;
 };
+type AgentStage = 'idle' | 'physiologist' | 'architect' | 'arbiter' | 'done';
 
 async function post(apiBase: string, path: string, body: unknown) {
   const res = await fetch(`${apiBase}${path}`, {
@@ -59,7 +60,7 @@ function Field({ label, children }: { label: string; children: ReactNode }) {
 }
 
 export default function AnalysisPanel({ model, apiBase }: { model: ModelJson | null; apiBase: string }) {
-  const [tab, setTab] = useState<'stability' | 'sweep' | 'bifurcation' | 'phase'>('stability');
+  const [tab, setTab] = useState<'stability' | 'sweep' | 'bifurcation' | 'phase' | 'agents'>('stability');
   const geneIds = model ? model.parts.map((p) => p.id) : [];
 
   // --- Stability ---
@@ -128,9 +129,36 @@ export default function AnalysisPanel({ model, apiBase }: { model: ModelJson | n
     catch (e) { setPhaseErr(e instanceof Error ? e.message : 'Unknown error'); }
     finally { setPhaseLoading(false); }
   }
-
+  const [agentStage, setAgentStage] = useState<AgentStage>('idle');
+  const [physiologistReview, setPhysiologistReview] = useState<string | null>(null);
+  const [architectReview, setArchitectReview] = useState<string | null>(null);
+  const [verdict, setVerdict] = useState<string | null>(null);
+  const [agentsErr, setAgentsErr] = useState<string | null>(null);
   if (!model) return null;
 
+  async function runAgentPanel() {
+    if (!model) return;
+    setAgentsErr(null); setPhysiologistReview(null); setArchitectReview(null); setVerdict(null);
+    try {
+      setAgentStage('physiologist');
+      const p = await post(apiBase, '/agent_review/physiologist', model);
+      setPhysiologistReview(p.review);
+
+      setAgentStage('architect');
+      const a = await post(apiBase, '/agent_review/architect', model);
+      setArchitectReview(a.review);
+
+      setAgentStage('arbiter');
+      const v = await post(apiBase, '/agent_review/arbiter', {
+        physiologist_review: p.review, architect_review: a.review, characterization: p.characterization,
+      });
+      setVerdict(v.verdict);
+      setAgentStage('done');
+    } catch (e) {
+      setAgentsErr(e instanceof Error ? e.message : 'Unknown error');
+      setAgentStage('idle');
+    }
+  }
   return (
     <Card>
       <div style={{ fontSize: 11, color: 'var(--text-muted)', letterSpacing: '0.08em', textTransform: 'uppercase', marginBottom: 14 }}>
@@ -140,7 +168,7 @@ export default function AnalysisPanel({ model, apiBase }: { model: ModelJson | n
       {/* Tabs: underline style, deliberately NOT btn-primary so they read as
           navigation, not as the action button below them. */}
       <div style={{ display: 'flex', gap: 4, marginBottom: 16, borderBottom: '1px solid var(--border)' }}>
-        {(['stability', 'sweep', 'bifurcation', 'phase'] as const).map((t) => (
+        {(['stability', 'sweep', 'bifurcation', 'phase', 'agents'] as const).map((t) => (
           <button
             key={t}
             onClick={() => setTab(t)}
@@ -156,7 +184,7 @@ export default function AnalysisPanel({ model, apiBase }: { model: ModelJson | n
               marginBottom: -1,
             }}
           >
-            {t === 'stability' ? 'Stability' : t === 'sweep' ? 'Sensitivity sweep' : t === 'bifurcation' ? 'Bifurcation' : 'Phase portrait'}
+            {t === 'stability' ? 'Stability' : t === 'sweep' ? 'Sensitivity sweep' : t === 'bifurcation' ? 'Bifurcation' : t === 'phase' ? 'Phase portrait' : 'Agent panel'}
           </button>
         ))}
       </div>
@@ -346,6 +374,43 @@ export default function AnalysisPanel({ model, apiBase }: { model: ModelJson | n
               </ResponsiveContainer>
             </div>
           )}
+        </div>
+      )}
+      {tab === 'agents' && (
+        <div>
+          <button className="btn-primary" onClick={runAgentPanel} disabled={agentStage !== 'idle' && agentStage !== 'done'}>
+            {agentStage === 'idle' || agentStage === 'done' ? 'Run agent panel' : 'Agents working...'}
+          </button>
+          {agentsErr && <ErrBox msg={agentsErr} />}
+          <div style={{ marginTop: 14, display: 'flex', flexDirection: 'column', gap: 12 }}>
+            {agentStage === 'physiologist' && !physiologistReview && (
+              <div style={{ fontSize: 13, color: 'var(--text-muted)' }}>Circuit Physiologist is reading the stability and trace data...</div>
+            )}
+            {physiologistReview && (
+              <div style={{ border: '1px solid var(--border)', borderRadius: 8, padding: '12px 14px' }}>
+                <div style={{ fontSize: 12, color: '#4a90d9', fontWeight: 600, marginBottom: 6 }}>CIRCUIT PHYSIOLOGIST</div>
+                <p style={{ fontSize: 14, color: 'var(--text-secondary)', margin: 0 }}>{physiologistReview}</p>
+              </div>
+            )}
+            {agentStage === 'architect' && !architectReview && (
+              <div style={{ fontSize: 13, color: 'var(--text-muted)' }}>Circuit Architect is comparing gene parameters...</div>
+            )}
+            {architectReview && (
+              <div style={{ border: '1px solid var(--border)', borderRadius: 8, padding: '12px 14px' }}>
+                <div style={{ fontSize: 12, color: '#ff8a5c', fontWeight: 600, marginBottom: 6 }}>CIRCUIT ARCHITECT</div>
+                <p style={{ fontSize: 14, color: 'var(--text-secondary)', margin: 0 }}>{architectReview}</p>
+              </div>
+            )}
+            {agentStage === 'arbiter' && !verdict && (
+              <div style={{ fontSize: 13, color: 'var(--text-muted)' }}>Arbiter is weighing both assessments...</div>
+            )}
+            {verdict && (
+              <div style={{ border: '1px solid #33d6a6', borderRadius: 8, padding: '12px 14px' }}>
+                <div style={{ fontSize: 12, color: '#33d6a6', fontWeight: 600, marginBottom: 6 }}>ARBITER'S VERDICT</div>
+                <p style={{ fontSize: 14, color: 'var(--text-secondary)', margin: 0 }}>{verdict}</p>
+              </div>
+            )}
+          </div>
         </div>
       )}
     </Card>
